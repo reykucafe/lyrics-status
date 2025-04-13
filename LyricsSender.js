@@ -6,7 +6,8 @@
 // @author       OvalQuilter | OQ project
 // @match        *://open.spotify.com/*
 // @icon         https://raw.githubusercontent.com/OvalQuilter/lyrics-status/main/Logo.png
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      lrclib.net
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js
 // ==/UserScript==
 $(`
@@ -901,24 +902,54 @@ function modal(title, description, styles = {}) {
         e.parentNode.parentNode === modalWindow[0] ? $(e).click(() => { modalWindow.remove(); }) : null;
     }
 }
-function loadLyrics(lyrics) {
-    if(lyrics.syncType == "UNSYNCED") {
-        let timePerLyric = Math.round(playbackState.trackDuration / lyrics.lines.length);
-        lyrics.lines.reduce((p, c, i, a) => {
-            playbackState.lyrics.push({
-                time: p,
-                words: c.words
-            });
-            return p + timePerLyric;
-        }, timePerLyric);
-    } else {
-        for (let line of lyrics.lines) {
-            playbackState.lyrics.push({
-                time: +line.startTimeMs,
-                words: line.words,
-            });
+function parseLrcLyrics(lrcText) {
+    const lines = lrcText.split('\n');
+    const pattern = /^\[(\d+):(\d+\.\d+)\](.*)/;
+    const parsedLyrics = [];
+
+    for (const line of lines) {
+        const match = line.match(pattern);
+        if (match) {
+            const minutes = parseInt(match[1]);
+            const seconds = parseFloat(match[2]);
+            const text = match[3].trim();
+            const timeMs = Math.floor((minutes * 60 + seconds) * 1000);
+            parsedLyrics.push({ time: timeMs, words: text });
         }
     }
+    parsedLyrics.sort((a, b) => a.time - b.time);
+    return parsedLyrics;
+}
+async function fetchLyricsFromLrclib(trackName, artistName) {
+    return new Promise((resolve) => {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}`,
+            onload: function(response) {
+                if (response.status === 200) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (data.syncedLyrics) {
+                            const parsed = parseLrcLyrics(data.syncedLyrics);
+                            resolve({ success: true, lyrics: parsed });
+                        } else if (data.lyrics) {
+                            const parsed = [{ time: 0, words: data.lyrics }];
+                            resolve({ success: true, lyrics: parsed });
+                        } else {
+                            resolve({ success: false, error: "No lyrics available" });
+                        }
+                    } catch (e) {
+                        resolve({ success: false, error: "Failed to parse response" });
+                    }
+                } else {
+                    resolve({ success: false, error: `HTTP ${response.status}` });
+                }
+            },
+            onerror: function(error) {
+                resolve({ success: false, error: "Request failed" });
+            }
+        });
+    });
 }
 function updatePlaybackState() {
     let start = Date.now();
@@ -932,7 +963,7 @@ function updatePlaybackState() {
             "Authorization": `Bearer ${accessToken}`
         },
         statusCode: {
-            200: d => {
+            200: async d => {
                 debugPlayback.html(`${Date.now() - start}ms`);
 
                 if(playbackState.trackId !== d.item.id) {
@@ -947,48 +978,22 @@ function updatePlaybackState() {
                     playbackState.oldTrackId = playbackState.trackId;
                     playbackState.trackId = d.item.id;
                     playbackState.trackDuration = d.item.duration_ms;
-
                     playbackState.lyrics = [];
 
-                    fetch(`https://spclient.wg.spotify.com/color-lyrics/v2/track/${playbackState.trackId}?format=json&vocalRemoval=false&market=from_token`, {
-                        "headers": {
-                            "accept": "application/json",
-                            "accept-language": "ru",
-                            "app-platform": "WebPlayer",
-                            "authorization": "Bearer " + accessToken,
-                            "spotify-app-version": "1.2.40.176.g6d58cb73"
-                        },
-                        "referrer": "https://open.spotify.com/",
-                        "referrerPolicy": "strict-origin-when-cross-origin",
-                        "body": null,
-                        "method": "GET",
-                        "credentials": "include"
-                    })
-                    .then(async (response) => {
-                        let d;
-                        try {
-                            d = await response.json();
-                        } catch(e) {}
-                        // ^^^ json() will break if request failed
+                    const lyricsResult = await fetchLyricsFromLrclib(
+                        playbackState.trackName,
+                        playbackState.trackAuthor
+                    );
 
-                        if (response.status == 200) {
-                            playbackState.lyricsFullRes = d;
-
-                            const dLyrics = d.lyrics;
-
-                            if(dLyrics.showUpsell) return addLog("You probably don't have Spotify Premium subscription. Spotify made lyrics available only for Premium users, the script won't work.<br>If you think this is a mistake please open issue on GitHub.", "error");
-
-                            loadLyrics(dLyrics);
-
-                            playbackState.hasLyrics = true;
-                        }
-                        if (response.status == 404) {
-                            playbackState.hasLyrics = false;
-
-                            addLog(`Spotify doesn't have lyrics for this song (${playbackState.trackName}). Status won't change.`, "warning");
-                            changeStatusRequest(settings.token, "");
-                        }
-                    });
+                    if (lyricsResult.success) {
+                        playbackState.lyrics = lyricsResult.lyrics;
+                        playbackState.hasLyrics = true;
+                        addLog(`Successfully fetched lyrics for "${playbackState.trackName}"`, "log");
+                    } else {
+                        playbackState.hasLyrics = false;
+                        addLog(`Failed to get lyrics for "${playbackState.trackName}": ${lyricsResult.error}`, "warning");
+                        changeStatusRequest(settings.token, "");
+                    }
                 }
 
                 playbackState.trackProgress = d.progress_ms;
